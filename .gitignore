@@ -1,0 +1,12 @@
+# never commit real config values
+Config.ps1
+
+# logs
+*.log
+Logs/
+
+# editor noise
+.vscode/
+*.code-workspace
+Thumbs.db
+.DS_Store
