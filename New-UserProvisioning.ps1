@@ -1,106 +1,63 @@
 #Requires -Modules ActiveDirectory, MSOnline, ExchangeOnlineManagement
 
-<#
-.SYNOPSIS
-    Provisions a new user across AD, M365, and Intune.
+# user provisioning script
+# run as domain admin
+# needs MSOnline and ExchangeOnlineManagement modules installed first
+#   Install-Module MSOnline
+#   Install-Module ExchangeOnlineManagement
 
-.DESCRIPTION
-    Automates the full joiner workflow:
-      - Creates the AD account with standard attributes
-      - Syncs to Entra ID via AAD Connect (or waits for sync)
-      - Assigns M365 license
-      - Adds user to specified security and M365 groups
-      - Sets manager, department, and office attributes
-      - Sends a welcome email to the manager with temp credentials
-      - Logs all actions to a local log file
-
-.PARAMETER FirstName
-    User's first name.
-
-.PARAMETER LastName
-    User's last name.
-
-.PARAMETER Department
-    Department the user belongs to. Must match an entry in $DepartmentConfig.
-
-.PARAMETER JobTitle
-    User's job title. Written to AD and M365 profile.
-
-.PARAMETER Manager
-    SAMAccountName of the user's manager.
-
-.PARAMETER Location
-    Office location. Accepted: HQ, Remote, Branch1, Branch2
-
-.PARAMETER LicenseSKU
-    M365 license to assign. Defaults to BusinessPremium.
-    Accepted: BusinessPremium, E3, E5, F3
-
-.EXAMPLE
-    .\New-UserProvisioning.ps1 -FirstName "Jane" -LastName "Smith" `
-        -Department "Finance" -JobTitle "Accountant" `
-        -Manager "jdoe" -Location "HQ"
-
-.NOTES
-    Requires: AD module, MSOnline, ExchangeOnlineManagement
-    Run as: Domain Admin or delegated OU admin + Exchange Admin
-    Log path: C:\Logs\Provisioning\
-#>
-
-[CmdletBinding(SupportsShouldProcess)]
 param (
     [Parameter(Mandatory)] [string] $FirstName,
     [Parameter(Mandatory)] [string] $LastName,
     [Parameter(Mandatory)] [string] $Department,
     [Parameter(Mandatory)] [string] $JobTitle,
     [Parameter(Mandatory)] [string] $Manager,
-    [Parameter(Mandatory)]
-    [ValidateSet('HQ','Remote','Branch1','Branch2')]
-    [string] $Location,
-    [ValidateSet('BusinessPremium','E3','E5','F3')]
+    [Parameter(Mandatory)] [string] $Location,
     [string] $LicenseSKU = 'BusinessPremium'
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-
 . "$PSScriptRoot\Config.ps1"
 
+# log everything to a file, makes it easier to see what happened if something breaks
 $LogDir  = 'C:\Logs\Provisioning'
 $LogFile = Join-Path $LogDir "$(Get-Date -Format 'yyyy-MM-dd')_provisioning.log"
 
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-
-function Write-Log {
-    param([string]$Message, [ValidateSet('INFO','WARN','ERROR')] [string]$Level = 'INFO')
-    $entry = "[{0}] [{1}] {2}" -f (Get-Date -Format 'HH:mm:ss'), $Level, $Message
-    Add-Content -Path $LogFile -Value $entry
-    switch ($Level) {
-        'WARN'  { Write-Warning $Message }
-        'ERROR' { Write-Error   $Message }
-        default { Write-Host    $entry -ForegroundColor Cyan }
-    }
+if (-not (Test-Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
 
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $entry = "[$(Get-Date -Format 'HH:mm:ss')] [$Level] $Message"
+    Add-Content -Path $LogFile -Value $entry
+    if ($Level -eq 'WARN') { Write-Warning $Message }
+    elseif ($Level -eq 'ERROR') { Write-Error $Message }
+    else { Write-Host $entry }
+}
+
+# generate a random password that meets most complexity requirements
+# upper + lower + number + special, then shuffle
 function New-RandomPassword {
-    $upper   = [char[]]'ABCDEFGHJKLMNPQRSTUVWXYZ'
-    $lower   = [char[]]'abcdefghjkmnpqrstuvwxyz'
-    $numbers = [char[]]'23456789'
-    $special = [char[]]'!@#$%^&*'
-    $all     = $upper + $lower + $numbers + $special
-    $pwd     = ($upper   | Get-Random) `
-             + ($lower   | Get-Random) `
-             + ($numbers | Get-Random) `
-             + ($special | Get-Random) `
-             + (-join (1..8 | ForEach-Object { $all | Get-Random }))
+    $chars = @{
+        upper   = [char[]]'ABCDEFGHJKLMNPQRSTUVWXYZ'
+        lower   = [char[]]'abcdefghjkmnpqrstuvwxyz'
+        numbers = [char[]]'23456789'
+        special = [char[]]'!@#$%^&*'
+    }
+    $all = $chars.upper + $chars.lower + $chars.numbers + $chars.special
+    $pwd = ($chars.upper | Get-Random) + ($chars.lower | Get-Random) +
+           ($chars.numbers | Get-Random) + ($chars.special | Get-Random) +
+           (-join (1..8 | ForEach-Object { $all | Get-Random }))
     return -join ($pwd.ToCharArray() | Get-Random -Count $pwd.Length)
 }
 
+# build UPN, handle duplicates by appending a number
+# e.g. if john.smith exists, try john.smith1, john.smith2, etc
 function Get-UPN {
     param([string]$First, [string]$Last)
     $base = "$($First.ToLower()).$($Last.ToLower())"
-    $upn  = "$base@$($Config.Domain)"
-    $i    = 1
+    $upn = "$base@$($Config.Domain)"
+    $i = 1
     while (Get-ADUser -Filter "UserPrincipalName -eq '$upn'" -ErrorAction SilentlyContinue) {
         $upn = "$base$i@$($Config.Domain)"
         $i++
@@ -108,12 +65,13 @@ function Get-UPN {
     return $upn
 }
 
-function Get-SAMAccountName {
+function Get-SAM {
     param([string]$First, [string]$Last)
+    # first initial + last name, max 20 chars, lowercase
     $base = ($First.Substring(0,1) + $Last).ToLower() -replace '[^a-z0-9]',''
     if ($base.Length -gt 20) { $base = $base.Substring(0,20) }
     $sam = $base
-    $i   = 1
+    $i = 1
     while (Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue) {
         $sam = "$base$i"
         $i++
@@ -121,193 +79,176 @@ function Get-SAMAccountName {
     return $sam
 }
 
-Write-Log "Starting provisioning for $FirstName $LastName"
 
+Write-Log "Starting provisioning: $FirstName $LastName / $Department / $Location"
+
+# validate department exists in config
 if (-not $Config.Departments.ContainsKey($Department)) {
-    Write-Log "Department '$Department' not found in config." 'ERROR'
-    throw "Invalid department."
+    Write-Log "Unknown department: $Department" 'ERROR'
+    throw "Department not found in config. Check Config.ps1."
 }
-$DeptConfig = $Config.Departments[$Department]
+$dept = $Config.Departments[$Department]
 
-$ManagerObj = Get-ADUser -Identity $Manager -Properties EmailAddress -ErrorAction Stop
-Write-Log "Manager resolved: $($ManagerObj.Name) <$($ManagerObj.EmailAddress)>"
+# make sure the manager account actually exists before we do anything
+$mgr = Get-ADUser -Identity $Manager -Properties EmailAddress -ErrorAction Stop
+Write-Log "Manager: $($mgr.Name)"
 
-$OfficeInfo  = $Config.Locations[$Location]
-$SAM         = Get-SAMAccountName -First $FirstName -Last $LastName
-$UPN         = Get-UPN            -First $FirstName -Last $LastName
-$Password    = New-RandomPassword
-$SecurePwd   = ConvertTo-SecureString $Password -AsPlainText -Force
-$DisplayName = "$FirstName $LastName"
+$office      = $Config.Locations[$Location]
+$sam         = Get-SAM -First $FirstName -Last $LastName
+$upn         = Get-UPN -First $FirstName -Last $LastName
+$pwd         = New-RandomPassword
+$secpwd      = ConvertTo-SecureString $pwd -AsPlainText -Force
+$displayName = "$FirstName $LastName"
 
-Write-Log "SAM: $SAM | UPN: $UPN"
+Write-Log "UPN: $upn | SAM: $sam"
 
-# -- 1. Create AD account
-Write-Log "Creating AD account..."
 
-$ADParams = @{
-    Name                  = $DisplayName
+# ---- create the AD account ----
+
+$newUserParams = @{
+    Name                  = $displayName
     GivenName             = $FirstName
     Surname               = $LastName
-    SamAccountName        = $SAM
-    UserPrincipalName     = $UPN
-    DisplayName           = $DisplayName
+    SamAccountName        = $sam
+    UserPrincipalName     = $upn
+    DisplayName           = $displayName
     Department            = $Department
     Title                 = $JobTitle
-    Manager               = $ManagerObj.DistinguishedName
-    Office                = $OfficeInfo.OfficeName
-    StreetAddress         = $OfficeInfo.Street
-    City                  = $OfficeInfo.City
-    State                 = $OfficeInfo.State
-    PostalCode            = $OfficeInfo.Zip
+    Manager               = $mgr.DistinguishedName
+    Office                = $office.OfficeName
+    StreetAddress         = $office.Street
+    City                  = $office.City
+    State                 = $office.State
+    PostalCode            = $office.Zip
     Country               = 'US'
     Company               = $Config.CompanyName
-    AccountPassword       = $SecurePwd
+    AccountPassword       = $secpwd
     ChangePasswordAtLogon = $true
     Enabled               = $true
-    Path                  = $DeptConfig.OU
-    EmailAddress          = $UPN
+    Path                  = $dept.OU
+    EmailAddress          = $upn
 }
 
-if ($PSCmdlet.ShouldProcess($UPN, 'Create AD User')) {
-    New-ADUser @ADParams
-    Write-Log "AD account created: $UPN"
-}
+New-ADUser @newUserParams
+Write-Log "AD account created"
 
-if ($DeptConfig.ContainsKey('PhoneExtPrefix')) {
-    Set-ADUser -Identity $SAM -OfficePhone "$($DeptConfig.PhoneExtPrefix)0000"
-}
+# base group all users get added to (used for intune enrollment scope)
+Add-ADGroupMember -Identity $Config.BaseGroup -Members $sam
 
-Add-ADGroupMember -Identity $Config.BaseGroup -Members $SAM
-Write-Log "Added to base group: $($Config.BaseGroup)"
-
-foreach ($group in $DeptConfig.Groups) {
+# dept groups
+foreach ($g in $dept.Groups) {
     try {
-        Add-ADGroupMember -Identity $group -Members $SAM
-        Write-Log "Added to group: $group"
+        Add-ADGroupMember -Identity $g -Members $sam
+        Write-Log "Added to: $g"
     } catch {
-        Write-Log "Could not add to group '$group': $_" 'WARN'
+        Write-Log "Couldn't add to $g - $($_.Exception.Message)" 'WARN'
     }
 }
 
-if ($OfficeInfo.ContainsKey('Group')) {
-    Add-ADGroupMember -Identity $OfficeInfo.Group -Members $SAM
-    Write-Log "Added to location group: $($OfficeInfo.Group)"
+# location group if defined
+if ($office.ContainsKey('Group')) {
+    Add-ADGroupMember -Identity $office.Group -Members $sam
 }
 
-# -- 2. Trigger AAD Connect sync
-Write-Log "Triggering AAD Connect delta sync..."
+
+# ---- sync to entra / wait for it to show up ----
+
+# kick off a delta sync on the AAD connect server
+# sometimes this fails if run remotely so we catch it and just wait longer
 try {
     Invoke-Command -ComputerName $Config.AADConnectServer -ScriptBlock {
         Import-Module ADSync
         Start-ADSyncSyncCycle -PolicyType Delta
     }
-    Write-Log "Sync triggered on $($Config.AADConnectServer)"
+    Write-Log "AAD Connect sync triggered"
+    Start-Sleep -Seconds 90
 } catch {
-    Write-Log "Could not trigger sync remotely. Initiate manually or wait for scheduled cycle." 'WARN'
+    Write-Log "Couldn't trigger AAD Connect sync remotely, waiting 3min for scheduled sync" 'WARN'
+    Start-Sleep -Seconds 180
 }
 
-Write-Log "Waiting for Entra ID propagation (90s)..."
-Start-Sleep -Seconds 90
 
-# -- 3. Assign M365 license
-Write-Log "Connecting to MSOnline..."
+# ---- assign M365 license ----
+
 Connect-MsolService
 
-$MsolUser = $null
+# poll until the user shows up in entra, give it up to 5 minutes
+$msolUser = $null
 $attempts = 0
-while (-not $MsolUser -and $attempts -lt 6) {
-    $MsolUser = Get-MsolUser -UserPrincipalName $UPN -ErrorAction SilentlyContinue
-    if (-not $MsolUser) {
-        Write-Log "Entra ID user not found yet, retrying in 30s... ($attempts/6)" 'WARN'
-        Start-Sleep -Seconds 30
-    }
+while (-not $msolUser -and $attempts -lt 10) {
+    Start-Sleep -Seconds 30
+    $msolUser = Get-MsolUser -UserPrincipalName $upn -ErrorAction SilentlyContinue
     $attempts++
 }
 
-if (-not $MsolUser) {
-    Write-Log "User did not appear in Entra ID after 3min. Assign license manually." 'ERROR'
-    throw "Entra ID sync timeout for $UPN"
+if (-not $msolUser) {
+    Write-Log "User never showed up in Entra ID - assign license manually" 'ERROR'
+    throw "Entra sync timeout"
 }
 
-$SKU = $Config.LicenseSKUs[$LicenseSKU]
-Set-MsolUser -UserPrincipalName $UPN -UsageLocation $Config.UsageLocation
-Set-MsolUserLicense -UserPrincipalName $UPN -AddLicenses $SKU
-Write-Log "License assigned: $LicenseSKU ($SKU)"
+Set-MsolUser -UserPrincipalName $upn -UsageLocation $Config.UsageLocation
+Set-MsolUserLicense -UserPrincipalName $upn -AddLicenses $Config.LicenseSKUs[$LicenseSKU]
+Write-Log "License assigned: $LicenseSKU"
 
-# -- 4. M365 group memberships
-Write-Log "Connecting to Exchange Online..."
+
+# ---- M365 groups ----
+
 Connect-ExchangeOnline -ShowBanner:$false
 
-foreach ($m365group in $DeptConfig.M365Groups) {
+foreach ($g in $dept.M365Groups) {
     try {
-        Add-UnifiedGroupLinks -Identity $m365group -LinkType Members -Links $UPN
-        Write-Log "Added to M365 group: $m365group"
+        Add-UnifiedGroupLinks -Identity $g -LinkType Members -Links $upn
+        Write-Log "Added to M365 group: $g"
     } catch {
-        Write-Log "Could not add to M365 group '$m365group': $_" 'WARN'
+        # non-fatal, log it and move on
+        Write-Log "M365 group add failed for $g - $($_.Exception.Message)" 'WARN'
     }
 }
 
-# -- 5. Intune enrollment note
-Write-Log "Intune: user will be auto-enrolled on next device sign-in via AAD Join policy."
-Write-Log "Verify enrollment policy scope includes group: $($Config.BaseGroup)"
 
-# -- 6. Welcome email to manager
-Write-Log "Sending welcome email to manager: $($ManagerObj.EmailAddress)"
+# ---- email manager ----
 
-$EmailBody = @"
-Hi $($ManagerObj.GivenName),
+# TODO: move this to a proper email template file at some point
+$body = @"
+Hi $($mgr.GivenName),
 
-$FirstName $LastName's account has been provisioned and is ready.
+$displayName is all set.
 
-Account details
----------------
-Username      : $UPN
-Temp password : $Password
-(User will be prompted to change on first login)
+Username: $upn
+Temp password: $pwd
 
-What's been set up
-------------------
-- Active Directory account (OU: $($DeptConfig.OU))
-- M365 license: $LicenseSKU
-- Security groups: $($DeptConfig.Groups -join ', ')
-- M365 groups: $($DeptConfig.M365Groups -join ', ')
-- Office location: $($OfficeInfo.OfficeName)
+They'll be asked to change it on first login. Please give it to them directly,
+don't forward this email.
 
-Next steps
-----------
-- Provide the temp password to $FirstName directly (do not forward this email)
-- Confirm device enrollment in Intune within 24hrs of first sign-in
-- Submit a ticket if any additional application access is needed
+Groups: $($dept.Groups -join ', ')
+License: $LicenseSKU
+Office: $($office.OfficeName)
 
--- IT Systems
+Let IT know if anything looks wrong or they need extra access.
+
+- IT
 "@
 
-Send-MailMessage `
-    -To         $ManagerObj.EmailAddress `
-    -From       $Config.NotificationEmail `
-    -Subject    "New account ready: $DisplayName" `
-    -Body       $EmailBody `
-    -SmtpServer $Config.SMTPRelay
+try {
+    Send-MailMessage -To $mgr.EmailAddress -From $Config.NotificationEmail `
+        -Subject "Account ready: $displayName" -Body $body -SmtpServer $Config.SMTPRelay
+    Write-Log "Email sent to $($mgr.EmailAddress)"
+} catch {
+    Write-Log "Failed to send email: $($_.Exception.Message)" 'WARN'
+}
 
-Write-Log "Welcome email sent to $($ManagerObj.EmailAddress)"
 
-# -- 7. Summary
-Write-Log "Provisioning complete for $DisplayName"
-Write-Log "--------------------------------------------"
-Write-Log "UPN      : $UPN"
-Write-Log "SAM      : $SAM"
-Write-Log "License  : $LicenseSKU"
-Write-Log "Location : $Location"
-Write-Log "Log file : $LogFile"
-Write-Log "--------------------------------------------"
+# ---- done ----
+
+Write-Log "Done: $displayName / $upn"
 
 [PSCustomObject]@{
-    DisplayName   = $DisplayName
-    UPN           = $UPN
-    SAM           = $SAM
-    TempPassword  = $Password
-    License       = $LicenseSKU
-    Department    = $Department
-    Location      = $Location
-    ProvisionedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    Name      = $displayName
+    UPN       = $upn
+    SAM       = $sam
+    Password  = $pwd
+    License   = $LicenseSKU
+    Dept      = $Department
+    Location  = $Location
+    Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 }
